@@ -63,6 +63,13 @@ char* Arena::AllocateNewBlock(size_t block_bytes) {
 }
 ```
 `AllocateNewBlock`函数利用new的方式申请block_bytes字节大小的内存，并更新blocks_和memory_usage_信息。
+此处`memory_usage.fetch_add()`函数是`atomic`中的加法函数，用于将指定的整数加到`memory_usage`上，
+需指定`atomic`原子操作的顺序，此处由于是分配内存，**不存在先后顺序要求**，故使用`memory_order_relaxed`来提供最高的性能
+以下是来自ChatGPT的解释：
+> `memory_order_relaxed`：对于同一原子变量的多个原子操作之间不存在任何顺序关系，也就是说这些操作可以在任意时间任意顺序执行。  
+> 通常情况下使用`memory_order_relaxed`可以获得最好的性能表现，但是需要确保并发操作不会产生任何错误。
+
+关于`fetch_add()`的内容可以参考`FunctionTestCase/AtomicFetchAdd.cpp`中的样例
 ***
 ``` C++
 inline char* Arena::Allocate(size_t bytes) {
