@@ -1,7 +1,7 @@
 # LevelDB数据编码
 ## 源码解读
 LevelDB默认使用小端字节序存储，低位字节排放在内存的低地址端，高位字节排放在内存的高地址端。
-### 定长数据
+### 整型数据
 ``` C++
 inline void EncodeFixed32(char* dst, uint32_t value) {
   uint8_t* const buffer = reinterpret_cast<uint8_t*>(dst);
@@ -45,18 +45,6 @@ inline void EncodeFixed64(char* dst, uint64_t value) {
 }
 
 // Lower-level versions of Get... that read directly from a character buffer
-// without any bounds checking.
-
-inline uint32_t DecodeFixed32(const char* ptr) {
-  const uint8_t* const buffer = reinterpret_cast<const uint8_t*>(ptr);
-
-  // Recent clang and gcc optimize this to a single mov / ldr instruction.
-  return (static_cast<uint32_t>(buffer[0])) |
-         (static_cast<uint32_t>(buffer[1]) << 8) |
-         (static_cast<uint32_t>(buffer[2]) << 16) |
-         (static_cast<uint32_t>(buffer[3]) << 24);
-}
-
 inline uint64_t DecodeFixed64(const char* ptr) {
   const uint8_t* const buffer = reinterpret_cast<const uint8_t*>(ptr);
 
@@ -72,7 +60,53 @@ inline uint64_t DecodeFixed64(const char* ptr) {
 }
 ```
 64位数据同上，但需注意dst指向的地址须有足够空间写入对应数据
+***
+``` C++
+void PutFixed32(std::string* dst, uint32_t value) {
+  char buf[sizeof(value)];
+  EncodeFixed32(buf, value);
+  dst->append(buf, sizeof(buf));
+}
+
+void PutFixed64(std::string* dst, uint64_t value) {
+  char buf[sizeof(value)];
+  EncodeFixed64(buf, value);
+  dst->append(buf, sizeof(buf));
+}
+```
+`sizeof`按字节统计对应数据的大小，此处将value数据存入buf中后，并将对应数据作为字符串附加至dst所指向的字符串后
 ### 变长数据
+将整型`int`编码成变长整型`varint`可以尽可能节约存储空间。例如一些较小的数字，采用传统`uint32_t`编码需要四个字节，但是利用`varint`则舍弃为0的高位，用较少字节存储信息。具体代码解释如下
+``` C++
+char* EncodeVarint32(char* dst, uint32_t v) {
+  // Operate on characters as unsigneds
+  uint8_t* ptr = reinterpret_cast<uint8_t*>(dst);
+  static const int B = 128;
+  if (v < (1 << 7)) {
+    *(ptr++) = v;
+  } else if (v < (1 << 14)) {
+    *(ptr++) = v | B;
+    *(ptr++) = v >> 7;
+  } else if (v < (1 << 21)) {
+    *(ptr++) = v | B;
+    *(ptr++) = (v >> 7) | B;
+    *(ptr++) = v >> 14;
+  } else if (v < (1 << 28)) {
+    *(ptr++) = v | B;
+    *(ptr++) = (v >> 7) | B;
+    *(ptr++) = (v >> 14) | B;
+    *(ptr++) = v >> 21;
+  } else {
+    *(ptr++) = v | B;
+    *(ptr++) = (v >> 7) | B;
+    *(ptr++) = (v >> 14) | B;
+    *(ptr++) = (v >> 21) | B;
+    *(ptr++) = v >> 28;
+  }
+  return reinterpret_cast<char*>(ptr);
+}
+```
+
 ``` C++
 void PutFixed32(std::string* dst, uint32_t value);
 void PutFixed64(std::string* dst, uint64_t value);
