@@ -14,7 +14,8 @@ inline void EncodeFixed32(char* dst, uint32_t value) {
 }
 ```
 这里首先利用`reinterpret_cast`将`char`类型的指针dst转换为`uint8_t`类型的指针buffer，方便进行字节操作。  
-接下来，函数将value的每个字节分别存储到buffer的不同位置，并使用右移位运算符将高位字节移动到正确的位置。最终，buffer中存储的就是按little-endian字节序编码的value的值。
+接下来，函数将value的每个字节分别存储到buffer的不同位置，并使用右移位运算符将高位字节移动到正确的位置。最终，buffer中存储的就是按little-endian字节序编码的value的值。  
+先右移，再用uint_8强制转换取后8位。
 ***
 ``` C++
 inline uint32_t DecodeFixed32(const char* ptr) {
