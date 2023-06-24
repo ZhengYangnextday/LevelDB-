@@ -308,3 +308,324 @@ return s;
 最后，根据`Status s`依次向`dest_`中写入首部信息`buf`以及对应的数据`Slice(ptr, length)`，并判断s是否写入成功，若全部成功，则落盘刷新`dest_->Flush();`。之后将`block_offset`更新并返回`s`，为`AddRecord`中进一步操作做准备。
 ***
 ### Log读取
+### 成员变量及内置类
+```C++
+class Reporter {
+  public:
+  virtual ~Reporter();
+
+  // Some corruption was detected.  "bytes" is the approximate number
+  // of bytes dropped due to the corruption.
+  virtual void Corruption(size_t bytes, const Status& status) = 0;
+};
+```
+在`Reader`中内嵌`Reporter`类，用于报告错误，关于`Corruption`的定义根据具体情况有所不同。
+```C++
+SequentialFile* const file_;
+Reporter* const reporter_;
+bool const checksum_;
+char* const backing_store_;
+Slice buffer_;
+bool eof_;  // Last Read() indicated EOF by returning < kBlockSize
+
+// Offset of the last record returned by ReadRecord.
+uint64_t last_record_offset_;
+// Offset of the first location past the end of buffer_.
+uint64_t end_of_buffer_offset_;
+
+// Offset at which to start looking for the first record to return
+uint64_t const initial_offset_;
+
+// True if we are resynchronizing after a seek (initial_offset_ > 0). In
+// particular, a run of kMiddleType and kLastType records can be silently
+// skipped in this mode
+bool resyncing_;
+```
+- `SequentialFile* const file_`: 指向文件指针
+- `reporter_`: 指向reporter的指针
+- `checksum_`: bool值，用于验证checksums是否可用
+- `backing_store_`: Log的读取是以Block为单位去从磁盘取数据，从Block中取出的数据存储在blocking_store_中，相当于读数据的buffer。
+- `buffer_`: Slice类型，指向`backing_store_`，方便进行数据的操作
+- `eof_`: 
+- `last_record_offset_`: 上一条记录的偏移量
+- `end_of_buffer_offset_`: 上一个Block结束位置的偏移，即该block的起始位置，从该block开始查找第一个record。
+- `initial_offset_`: 初始偏移量，从该偏移往后查找出第一条记录，该偏移量可能意义不大
+- `resyncing_`: 
+***
+### 函数定义
+```C++
+Reader::Reporter::~Reporter() = default;
+
+Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
+               uint64_t initial_offset)
+    : file_(file),
+      reporter_(reporter),
+      checksum_(checksum),
+      backing_store_(new char[kBlockSize]),
+      buffer_(),
+      eof_(false),
+      last_record_offset_(0),
+      end_of_buffer_offset_(0),
+      initial_offset_(initial_offset),
+      resyncing_(initial_offset > 0) {}
+
+Reader::~Reader() { delete[] backing_store_; }
+```
+***
+```C++
+bool Reader::SkipToInitialBlock() {
+  const size_t offset_in_block = initial_offset_ % kBlockSize;
+  uint64_t block_start_location = initial_offset_ - offset_in_block;
+
+  // Don't search a block if we'd be in the trailer
+  if (offset_in_block > kBlockSize - 6) {
+    block_start_location += kBlockSize;
+  }
+
+  end_of_buffer_offset_ = block_start_location;
+
+  // Skip to start of first block that can contain the initial record
+  if (block_start_location > 0) {
+    Status skip_status = file_->Skip(block_start_location);
+    if (!skip_status.ok()) {
+      ReportDrop(block_start_location, skip_status);
+      return false;
+    }
+  }
+
+  return true;
+}
+```
+首先，计算`initial_offset_`在当前block中的偏移量`offset_in_block = initial_offset_ % kBlockSize;`以及当前block的起始位置(偏移量)`block_start_location = initial_offset_ - offset_in_block;`，从`initial_offset_`往后开始搜寻第一个record。  
+其次，由于当末尾不足7位时，block将自动填充0，因此若当前block中的偏移量`offset_in_block`已大于`kBlockSize`，则跳过该block，从下一个block开始搜寻。  
+之后，利用`SequentialFile`类内置函数实现跳转，并记录跳转的状态`skip_stutus`。若跳转失败，则需要通过`ReportDrop`函数，利用成员变量`reporter`传递报错信息，此时返回值为`false`。此外，跳转成功，返回值为`true`
+***
+```C++
+bool Reader::ReadRecord(Slice* record, std::string* scratch) {
+  if (last_record_offset_ < initial_offset_) {
+    if (!SkipToInitialBlock()) {
+      return false;
+    }
+  }
+
+  scratch->clear();
+  record->clear();
+  bool in_fragmented_record = false;
+  // Record offset of the logical record that we're reading
+  // 0 is a dummy value to make compilers happy
+  uint64_t prospective_record_offset = 0;
+
+  Slice fragment;
+  while (true) {
+    const unsigned int record_type = ReadPhysicalRecord(&fragment);
+
+    // ReadPhysicalRecord may have only had an empty trailer remaining in its
+    // internal buffer. Calculate the offset of the next physical record now
+    // that it has returned, properly accounting for its header size.
+    uint64_t physical_record_offset =
+        end_of_buffer_offset_ - buffer_.size() - kHeaderSize - fragment.size();
+
+    if (resyncing_) {
+      if (record_type == kMiddleType) {
+        continue;
+      } else if (record_type == kLastType) {
+        resyncing_ = false;
+        continue;
+      } else {
+        resyncing_ = false;
+      }
+    }
+
+    switch (record_type) {
+      case kFullType:
+        if (in_fragmented_record) {
+          // Handle bug in earlier versions of log::Writer where
+          // it could emit an empty kFirstType record at the tail end
+          // of a block followed by a kFullType or kFirstType record
+          // at the beginning of the next block.
+          if (!scratch->empty()) {
+            ReportCorruption(scratch->size(), "partial record without end(1)");
+          }
+        }
+        prospective_record_offset = physical_record_offset;
+        scratch->clear();
+        *record = fragment;
+        last_record_offset_ = prospective_record_offset;
+        return true;
+
+      case kFirstType:
+        if (in_fragmented_record) {
+          // Handle bug in earlier versions of log::Writer where
+          // it could emit an empty kFirstType record at the tail end
+          // of a block followed by a kFullType or kFirstType record
+          // at the beginning of the next block.
+          if (!scratch->empty()) {
+            ReportCorruption(scratch->size(), "partial record without end(2)");
+          }
+        }
+        prospective_record_offset = physical_record_offset;
+        scratch->assign(fragment.data(), fragment.size());
+        in_fragmented_record = true;
+        break;
+
+      case kMiddleType:
+        if (!in_fragmented_record) {
+          ReportCorruption(fragment.size(),
+                           "missing start of fragmented record(1)");
+        } else {
+          scratch->append(fragment.data(), fragment.size());
+        }
+        break;
+
+      case kLastType:
+        if (!in_fragmented_record) {
+          ReportCorruption(fragment.size(),
+                           "missing start of fragmented record(2)");
+        } else {
+          scratch->append(fragment.data(), fragment.size());
+          *record = Slice(*scratch);
+          last_record_offset_ = prospective_record_offset;
+          return true;
+        }
+        break;
+
+      case kEof:
+        if (in_fragmented_record) {
+          // This can be caused by the writer dying immediately after
+          // writing a physical record but before completing the next; don't
+          // treat it as a corruption, just ignore the entire logical record.
+          scratch->clear();
+        }
+        return false;
+
+      case kBadRecord:
+        if (in_fragmented_record) {
+          ReportCorruption(scratch->size(), "error in middle of record");
+          in_fragmented_record = false;
+          scratch->clear();
+        }
+        break;
+
+      default: {
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "unknown record type %u", record_type);
+        ReportCorruption(
+            (fragment.size() + (in_fragmented_record ? scratch->size() : 0)),
+            buf);
+        in_fragmented_record = false;
+        scratch->clear();
+        break;
+      }
+    }
+  }
+  return false;
+}
+```
+`ReadRecord`的代码实现较长，将依次进行分析  
+- 跳转以及初始化  
+```C++
+bool Reader::ReadRecord(Slice* record, std::string* scratch) {
+  if (last_record_offset_ < initial_offset_) {
+    if (!SkipToInitialBlock()) {
+      return false;
+    }
+  }
+
+  scratch->clear();
+  record->clear();
+  bool in_fragmented_record = false;
+  // Record offset of the logical record that we're reading
+  // 0 is a dummy value to make compilers happy
+  uint64_t prospective_record_offset = 0;
+
+  Slice fragment;
+```
+首先判断是否需要进行跳转的操作，若上一条record的偏移量(或者说当前的偏移量)`last_record_offset_`已经大于等于初始偏移量`initial_offset`，表明下一条record已经是在初始偏移量`initial_offset`之后，此时无需进行调表操作，否则则需要执行跳转`SkipToInitialBlock`操作。
+***
+- asd
+***
+```C++
+unsigned int Reader::ReadPhysicalRecord(Slice* result) {
+  while (true) {
+    if (buffer_.size() < kHeaderSize) {
+      if (!eof_) {
+        // Last read was a full read, so this is a trailer to skip
+        buffer_.clear();
+        Status status = file_->Read(kBlockSize, &buffer_, backing_store_);
+        end_of_buffer_offset_ += buffer_.size();
+        if (!status.ok()) {
+          buffer_.clear();
+          ReportDrop(kBlockSize, status);
+          eof_ = true;
+          return kEof;
+        } else if (buffer_.size() < kBlockSize) {
+          eof_ = true;
+        }
+        continue;
+      } else {
+        // Note that if buffer_ is non-empty, we have a truncated header at the
+        // end of the file, which can be caused by the writer crashing in the
+        // middle of writing the header. Instead of considering this an error,
+        // just report EOF.
+        buffer_.clear();
+        return kEof;
+      }
+    }
+
+    // Parse the header
+    const char* header = buffer_.data();
+    const uint32_t a = static_cast<uint32_t>(header[4]) & 0xff;
+    const uint32_t b = static_cast<uint32_t>(header[5]) & 0xff;
+    const unsigned int type = header[6];
+    const uint32_t length = a | (b << 8);
+    if (kHeaderSize + length > buffer_.size()) {
+      size_t drop_size = buffer_.size();
+      buffer_.clear();
+      if (!eof_) {
+        ReportCorruption(drop_size, "bad record length");
+        return kBadRecord;
+      }
+      // If the end of the file has been reached without reading |length| bytes
+      // of payload, assume the writer died in the middle of writing the record.
+      // Don't report a corruption.
+      return kEof;
+    }
+
+    if (type == kZeroType && length == 0) {
+      // Skip zero length record without reporting any drops since
+      // such records are produced by the mmap based writing code in
+      // env_posix.cc that preallocates file regions.
+      buffer_.clear();
+      return kBadRecord;
+    }
+
+    // Check crc
+    if (checksum_) {
+      uint32_t expected_crc = crc32c::Unmask(DecodeFixed32(header));
+      uint32_t actual_crc = crc32c::Value(header + 6, 1 + length);
+      if (actual_crc != expected_crc) {
+        // Drop the rest of the buffer since "length" itself may have
+        // been corrupted and if we trust it, we could find some
+        // fragment of a real log record that just happens to look
+        // like a valid log record.
+        size_t drop_size = buffer_.size();
+        buffer_.clear();
+        ReportCorruption(drop_size, "checksum mismatch");
+        return kBadRecord;
+      }
+    }
+
+    buffer_.remove_prefix(kHeaderSize + length);
+
+    // Skip physical record that started before initial_offset_
+    if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length <
+        initial_offset_) {
+      result->clear();
+      return kBadRecord;
+    }
+
+    *result = Slice(header + kHeaderSize, length);
+    return type;
+  }
+}
+```
