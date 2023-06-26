@@ -913,6 +913,6 @@ if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length < initial_offs
 *result = Slice(header + kHeaderSize, length);
 return type;
 ```
-**注意: 这里的header指向的是`buffer_`执行`remove_prefix`前最初的数据指针，即`buffer_`执行`remove_prefix`前开始的第一条记录，但并非一定是一个block的第一条记录**
+**注意: 这里的header指向的是`buffer_`执行`remove_prefix`前最初的数据指针，即`buffer_`执行`remove_prefix`前开始的第一条记录，但并非一定是一个block的第一条记录**  
 `buffer_`首先更新，将数据指针指向`buffer_`中下一条record的开始。 
 之后判断该record的头部是否在`initial_offset_`之后，若不在，则清空result并返回`kBadRecord`，交由`ReadRecord`函数进一步操作。若在，则赋值`result`(更新`result`指向的数据)，并返回record的类型。
