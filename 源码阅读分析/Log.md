@@ -180,9 +180,48 @@ if (leftover < kHeaderSize) {
   block_offset_ = 0;
 }
 ```
+
 首先，若`block_offset`对应的偏移量超出Block的大小`KBlockSize`，则说明计算出错，因此引发报错。  
 其次，假如剩余空间已经小于record头部大小`kHeaderSize`，则将block剩余空间填充0，同时，将偏移量`block_offset_`重置为0，代表全新的block。  
 这当中依旧有对于record头部大小`kHeaderSize`正确性的判断，正确的`kHeaderSize`大小应为7。
+
+`dest_->Append`()方法是`writable file`类提供的，这是一个抽象方法，有很多重载方式，unix系统上采用的`env_posix.cc`中的方式:
+
+```c++
+  Status Append(const Slice& data) override {
+    size_t write_size = data.size();
+    const char* write_data = data.data();
+
+    // Fit as much as possible into buffer.
+    size_t copy_size = std::min(write_size, kWritableFileBufferSize - pos_);
+    std::memcpy(buf_ + pos_, write_data, copy_size);
+    write_data += copy_size;
+    write_size -= copy_size;
+    pos_ += copy_size;
+    if (write_size == 0) {
+      return Status::OK();
+    }
+        // Can't fit in buffer, so need to do at least one write.
+    Status status = FlushBuffer();
+    if (!status.ok()) {
+      return status;
+    }
+
+    // Small writes go to buffer, large writes are written directly.
+    if (write_size < kWritableFileBufferSize) {
+      std::memcpy(buf_, write_data, write_size);
+      pos_ = write_size;
+      return Status::OK();
+    }
+    return WriteUnbuffered(write_data, write_size);
+  }
+  ```
+
+使用memcpy进行复制，将data中的内容追加到buffer后，如果buffer容量不足，则清空buffer再做尝试。
+若可以一次写入，则直接写入，否则进入WriteUnbuffered方法另行写入。
+**然而在官方的测试中，为了减少由于系统接口出错造成的写入失败干扰测试，另行重载了Append方法，更简单，
+但是为此重写了一个logTest类**
+
 ***
 - 根据剩余block大小以及前后关系明确类型
 ```C++
