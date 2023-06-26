@@ -186,3 +186,38 @@ struct Comparator
 由于多线程太复杂看不懂，加锁关锁尝试了一下没能掌握，所以放弃了。原工程文件中测试文件
 后半部分为多线程读写测试的实现，主要流程是控制五个线程生成一定数量的key并插入到跳表中，
 同时这些线程也会尝试去读取自己写入位置的内容，得到的内容经验证都是有效的。
+
+```c++
+  void ReadStep(Random* rnd) {
+    // Remember the initial committed state of the skiplist.
+    State initial_state;
+    for (int k = 0; k < K; k++) {
+      initial_state.Set(k, current_.Get(k));
+    }
+
+    Key pos = RandomTarget(rnd);
+    SkipList<Key, Comparator>::Iterator iter(&list_);
+    iter.Seek(pos);
+    while (true) {
+      Key current;
+      if (!iter.Valid()) {
+        current = MakeKey(K, 0);
+      } else {
+        current = iter.key();
+        ASSERT_TRUE(IsValidKey(current)) << current;
+      }
+      ASSERT_LE(pos, current) << "should not go backwards";
+
+      // Verify that everything in [pos,current) was not present in
+      // initial_state.
+      while (pos < current) {
+        ASSERT_LT(key(pos), K) << pos;
+
+        // Note that generation 0 is never inserted, so it is ok if
+        // <*,0,*> is missing.
+        ASSERT_TRUE((gen(pos) == 0) ||
+                    (gen(pos) > static_cast<Key>(initial_state.Get(key(pos)))))
+            << "key: " << key(pos) << "; gen: " << gen(pos)
+            << "; initgen: " << initial_state.Get(key(pos));
+..........................
+```
