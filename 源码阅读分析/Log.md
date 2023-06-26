@@ -37,13 +37,14 @@
 一个log文件被划分为多个32K大小的block，每个block块都由一系列record记录组成，其结构如下  
 
 - block
-    - record
-      - checksum: uint32 //type和data的crc32c校验和，采用小端方式存储
-      - length: uint16 //数据长度
-      - type: uint8 //定义Record的类型，由于32K有限，可能无法在同一个block中存储完所有数据，因此需要定义利用首部定义，该record是否完整，以及位于整个record的哪一部分。
-      - data: uint8[length] //原始数据，以字节存储  
+  - record
+    - checksum: uint32 //type和data的crc32c校验和，采用小端方式存储
+    - length: uint16 //数据长度
+    - type: uint8 //定义Record的类型，由于32K有限，可能无法在同一个block中存储完所有数据，因此需要定义利用首部定义，该record是否完整，以及位于整个record的哪一部分。
+    - data: uint8[length] //原始数据，以字节存储  
 
 据此，分析log_format.h源码
+
 ```C++
 enum RecordType {
   // Zero is reserved for preallocated files
@@ -66,9 +67,13 @@ static const int kBlockSize = 32768;
 // Header is checksum (4 bytes), length (2 bytes), type (1 byte).
 static const int kHeaderSize = 4 + 2 + 1;
 ```
+
 这里定义了常数，包括最大类型号`kMaxRecordType`，避免类型不匹配；Block的大小`kBlockSize`为32 * 1024 bytes = 32768；首部的长度`kHeaderSize`为7。其中首部包括除数据外的三部分：校验和(4B)、数据长度(2B)以及record类型(1B)
+
 ### Log写入
+
 ### 成员变量
+
 ```C++
   WritableFile* dest_;
   int block_offset_;  // Current offset in block
@@ -78,8 +83,11 @@ static const int kHeaderSize = 4 + 2 + 1;
   // record type stored in the header.
   uint32_t type_crc_[kMaxRecordType + 1];
 ```
+
 首先`WritableFile* dest_`为指向可写文件的指针，不过多阐述。block_offset记录当前块地址偏移量，用于判断是否需要分块存储。type_crc_为数据类型的crc数据校验和，利用`InitTypeCrc()`函数预计算。
+
 ### 函数定义
+
 ```C++
 static void InitTypeCrc(uint32_t* type_crc) {
   for (int i = 0; i <= kMaxRecordType; i++) {
@@ -88,8 +96,10 @@ static void InitTypeCrc(uint32_t* type_crc) {
   }
 }
 ```
+
 预计算数据类型的校验和并记录到type_crc数组中，供后续操作使用。
 ***
+
 ```C++
 Writer::Writer(WritableFile* dest) : dest_(dest), block_offset_(0) {
   InitTypeCrc(type_crc_);
@@ -104,9 +114,11 @@ Writer(const Writer&) = delete;
 Writer& operator=(const Writer&) = delete;
 Writer::~Writer() = default;
 ```
+
 构造函数，须在开始时提供dest的数据长度，若不提供，将被初始化为空文件。此外，dest还需在Writer使用期间保持Live。  
 另外，Writer的拷贝构造函数和赋值运算符都被删除，意味着不能用它们来创建Writer的副本或将其赋值给另一个Writer。
 ***
+
 ```C++
 Status Writer::AddRecord(const Slice& slice) {
   const char* ptr = slice.data();
@@ -155,18 +167,24 @@ Status Writer::AddRecord(const Slice& slice) {
   return s;
 }
 ```
+
 ***
 本节代码较长，将依次分析  
+
 - 变量声明
+
 ```C++
 const char* ptr = slice.data();
 size_t left = slice.size();
 Status s;
 bool begin = true;
 ```
+
 声明变量，将传入的slice中数据指针赋值到ptr上，同时对left赋值slice的长度，为后续block的判断做铺垫。
 ***
+
 - 错误检测以及零填充
+
 ```C++
 const int leftover = kBlockSize - block_offset_;
 assert(leftover >= 0);
@@ -223,7 +241,9 @@ if (leftover < kHeaderSize) {
 但是为此重写了一个logTest类**
 
 ***
+
 - 根据剩余block大小以及前后关系明确类型
+
 ```C++
 assert(kBlockSize - block_offset_ - kHeaderSize >= 0);
 
@@ -242,25 +262,32 @@ if (begin && end) {
   type = kMiddleType;
 }
 ```
+
 首先计算该block剩余空间`avail = kBlockSize - block_offset_ - kHeaderSize`。由于在上一步补0操作中，若block中剩余空间大小小于`kHeaderSize`时，将补0，并重置`block_offset_`，从新的block开始存储，因此avail的值需大于0，否则报错。  
 之后比较left和avail的大小，若left小于等于avail，则**当前片段大小** `fragment_length`等于数据剩余大小`left`，否则等于`avail`。
 Type判断实现较为简单，利用两个标志位判断当前模块属于何种Type，具体效果如下：
+
 - 当begin和end同时为真时，表示在第一次循环中，left大小就小于avail大小，可以一次分配完，所以Type为`kFullType`
 - 当只有begin为真时，表示在第一次循环中，left大小大于avail大小，无法一次分配完，因此需要分块存储，在本块中存储的类型为`kFirstType`
 - 当只有end为真时，表示在非第一次循环中，或者已分块的后续操作中，剩余数据大小`left`小于可支配空间大小`avail`，因此在本块中存储完剩余信息，类型为`kLastType`
 - 当begin和end都为假时，表示在非第一次循环中，剩余数据无法一次存储，所以在该block中存储的为中间数据，类型为`kMiddleType`
+
 ***
+
 - 分配空间并更新参数
+
 ```C++
 s = EmitPhysicalRecord(type, ptr, fragment_length);
 ptr += fragment_length;
 left -= fragment_length;
 begin = false;
 ```
+
 将各个参数更新，`EmitPhysicalRecord`函数负责记录record的头部信息并将其合并到`dest_`当中，剩余信息更新，并将begin置为`false`，表示非第一次循环
 ***
 将错误检测以及零填充、根据剩余block大小以及前后关系明确类型、分配空间并更新参数在循环中执行，直至`s.ok() && left > 0`结果为假。这里需注意若s出错即`s.ok()`为`false`也会导致循环终止，此时返回s，根据s判断是否记录成功。
 ***
+
 ```C++
 Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr,
                                   size_t length) {
@@ -290,14 +317,18 @@ Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr,
   return s;
 }
 ```
+
 本节代码执行功能为上传record到block中存储，代码较长，依旧依次分析。  
 ***
+
 ```C++
 assert(length <= 0xffff);  // Must fit in two bytes
 assert(block_offset_ + kHeaderSize + length <= kBlockSize);
 ```
+
 首先，需进行错误判断，由于`kHeaderSize`中`length`分配字节数为2字节，因此若`length`超过了两字节，将出现数据溢出的情况，因此报错。此外，分配的空间应小于block的大小`kBlockSize`，因此利用`block_offset_ + kHeaderSize + length <= kBlockSize`判断是否分配合理。  
 ***
+
 ```C++
 char buf[kHeaderSize];
 buf[4] = static_cast<char>(length & 0xff);
@@ -309,8 +340,10 @@ uint32_t crc = crc32c::Extend(type_crc_[t], ptr, length);
 crc = crc32c::Mask(crc);  // Adjust for storage
 EncodeFixed32(buf, crc);
 ```
+
 之后，将首部信息存储在buf中，先将长度信息以及类型存储，之后再根据数据计算得到数据和record类型的32位校验码`crc`，存储在buf的0-3位
 ***
+
 ```C++
 Status s = dest_->Append(Slice(buf, kHeaderSize));
 if (s.ok()) {
@@ -322,14 +355,17 @@ if (s.ok()) {
 block_offset_ += kHeaderSize + length;
 return s;
 ```
+
 最后，根据`Status s`依次向`dest_`中写入首部信息`buf`以及对应的数据`Slice(ptr, length)`，并判断s是否写入成功，若全部成功，则落盘刷新`dest_->Flush();`。之后将`block_offset`更新并返回`s`，为`AddRecord`中进一步操作做准备。
 ***
+
 ### Log读取
 
 // Compute the crc of the record type and the payload.
 uint32_t crc = crc32c::Extend(type_crc_[t], ptr, length);
 crc = crc32c::Mask(crc);  // Adjust for storage
 EncodeFixed32(buf, crc);
+
 ```
 之后，将首部信息存储在buf中，先将长度信息以及类型存储，之后再根据数据计算得到数据和record类型的32位校验码`crc`，存储在buf的0-3位
 ***
@@ -344,10 +380,14 @@ if (s.ok()) {
 block_offset_ += kHeaderSize + length;
 return s;
 ```
+
 最后，根据`Status s`依次向`dest_`中写入首部信息`buf`以及对应的数据`Slice(ptr, length)`，并判断s是否写入成功，若全部成功，则落盘刷新`dest_->Flush();`。之后将`block_offset`更新并返回`s`，为`AddRecord`中进一步操作做准备。
 ***
+
 ### Log读取
+
 ### 成员变量及内置类
+
 ```C++
 class Reporter {
   public:
@@ -358,7 +398,9 @@ class Reporter {
   virtual void Corruption(size_t bytes, const Status& status) = 0;
 };
 ```
+
 在`Reader`中内嵌`Reporter`类，用于报告错误，关于`Corruption`的定义根据具体情况有所不同。
+
 ```C++
 SequentialFile* const file_;
 Reporter* const reporter_;
@@ -380,6 +422,7 @@ uint64_t const initial_offset_;
 // skipped in this mode
 bool resyncing_;
 ```
+
 - `SequentialFile* const file_`: 指向文件指针
 - `reporter_`: 指向reporter的指针
 - `checksum_`: bool值，用于验证checksums是否可用
@@ -390,8 +433,11 @@ bool resyncing_;
 - `end_of_buffer_offset_`: 缓存数据结束的偏移量，一般而言是某个block对应的偏移量
 - `initial_offset_`: 初始偏移量，从该偏移往后查找出第一条记录，该偏移量可能意义不大
 - `resyncing_`: 如果`initial_offset_`不为0，则寻找的record的类型一定是`kFullType`或者`kFirstType`，因此当`initial_offset_`大于0时，初次读取跳过`kMiddleType`和`kLastType`的判断
+
 ***
+
 ### 函数定义
+
 ```C++
 Reader::Reporter::~Reporter() = default;
 
@@ -410,9 +456,11 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
 
 Reader::~Reader() { delete[] backing_store_; }
 ```
+
 对数据进行初始化操作，析构函数时释放`backing_store_`。`checksum_`为校验和，作为可选项使用。
 ***
 ***
+
 ```C++
 bool Reader::SkipToInitialBlock() {
   const size_t offset_in_block = initial_offset_ % kBlockSize;
@@ -437,11 +485,13 @@ bool Reader::SkipToInitialBlock() {
   return true;
 }
 ```
+
 首先，计算`initial_offset_`在当前block中的偏移量`offset_in_block = initial_offset_ % kBlockSize;`以及当前block的起始位置(偏移量)`block_start_location = initial_offset_ - offset_in_block;`，从`initial_offset_`往后开始搜寻第一个record。  
 其次，由于当末尾不足7位时，block将自动填充0，因此若当前block中的偏移量`offset_in_block`已大于`kBlockSize`，则跳过该block，从下一个block开始搜寻。  
 之后，利用`SequentialFile`类内置函数实现跳转，并记录跳转的状态`skip_stutus`。若跳转失败，则需要通过`ReportDrop`函数，利用成员变量`reporter`传递报错信息，此时返回值为`false`。此外，跳转成功，返回值为`true`
 ***
 ***
+
 ```C++
 bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   if (last_record_offset_ < initial_offset_) {
@@ -563,8 +613,11 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   return false;
 }
 ```
+
 `ReadRecord`的代码实现较长，将依次进行分析  
+
 - 跳转以及初始化  
+
 ```C++
 bool Reader::ReadRecord(Slice* record, std::string* scratch) {
   if (last_record_offset_ < initial_offset_) {
@@ -582,11 +635,14 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
 
   Slice fragment;
 ```
+
 首先判断是否需要进行跳转的操作，若上一条record的偏移量(或者说当前的偏移量)`last_record_offset_`已经大于等于初始偏移量`initial_offset`，表明下一条record已经是在初始偏移量`initial_offset`之后，此时无需进行调表操作，否则则需要执行跳转`SkipToInitialBlock`操作。
 之后，将`record`和`scratch`清空，为之后的赋值操作做准备。这里读取记录的偏移量`prospective_record_offset`采用`uint64_t`格式，32位byte对应文件大小为4GB，无法满足数据存储要求，因此采用64位作为文件的偏移量，满足数据存储需要。  
 `in_fragment_record`作为标识符，判断是否处于一段连续的record之内。`prospective_record_offset`用来记录当前record的偏移量。这里设置为0是因为编译器对于0有专门处理优化。`fragment`存储当前record的信息。
 ***
+
 - 数据读取与类型判断
+
 ```C++
 while (true) {
   const unsigned int record_type = ReadPhysicalRecord(&fragment);
@@ -608,12 +664,15 @@ while (true) {
     }
   }
 ```
+
 首先，利用`ReadPhysicalRecord`函数读取一条record信息到`fragment`中，有关`ReadPhysicalRecord`的具体操作参后。注意`fragment`中可能并无有效数据，还需根据返回的record类型具体分析。
 之后根据`resyncling_`跳过部分数据处理，处理理由参见成员变量的说明。  
 在此操作中，还会计算当前record的偏移量`physical_record_offset =  end_of_buffer_offset_ - buffer_.size() - kHeaderSize - fragment.size();`
 ***
+
 - 根据条件选择合适处理方式
 由于情况较多，将逐个进行分析
+
 ```C++
 switch (record_type) {
   case kFullType:
@@ -632,11 +691,13 @@ switch (record_type) {
     last_record_offset_ = prospective_record_offset;
     return true;
 ```
+
 在分析之前，首先需明确`scratch`的作用。`Slice result`无法对数据进行处理操作，需要通过额外的参数调整`result`指针指向的数据，此参数即为`scratch`。
 第一种情况为读取的数据类型为`kFullType`。若`in_fragmented_record`为`true`，则表示处于某一个片段中。产生的原因有两种: 在早期版本中，`log_writer`会在block末尾上传一段空的类型为`kFirstType`或者`kFullType`的记录，因此出现位于记录片段，但是并不是片段类数据的情况。但在该情况下，`scratch`中应无对应缓存，因此若`scratch`不为空，则是出现片段出错的情况，由`reporter`报错信息。  
 之后，将记录的偏移量记录`prospective_record_offset = physical_record_offset;`。并清空`scratch`中的数据，为后续判断做准备。将`record`数据置为`fragment`，并更新记录上一条记录的偏移量。  
 在该种情况下，由于数据正常读出，因此无论是否出现片段出错，都返回该片段。
 ***
+
 ```C++
   case kFirstType:
     if (in_fragmented_record) {
@@ -653,10 +714,12 @@ switch (record_type) {
     in_fragmented_record = true;
     break;
 ```
+
 第二种情况为读取的数据类型为`kFirstType`。由于处于初始状态，理论上`in_fragmented_record`此时还未置为`true`，因此增加错误判定。具体说明同`kFullType`，此处不再赘述。  
 由于`prospective_record_offset`位于循环外，不会因为循环更新，因此先由`prospective_record_offset`记录下此时的记录物理偏移量`physical_record_offset`。
 将`scratch`内容更新为`fragment`中的数据，为数据合并做准备。同时，将片段标识符`in_fragment_record`更新为`true`，表明数据处于片段中。
 ***
+
 ```C++
   case kMiddleType:
     if (!in_fragmented_record) {
@@ -667,9 +730,11 @@ switch (record_type) {
     }
     break;
 ```
+
 第三种情况为读取的数据类型为`kMiddleType`，此时需保证`in_fragmented_record`为`true`，否则说明读取时未读取到`kFirstType`类型的record，需要报错。  
 由于位于record的中间位置，因此仅用向`scratch`后附加数据即可。
 ***
+
 ```C++
   case kLastType:
     if (!in_fragmented_record) {
@@ -683,9 +748,11 @@ switch (record_type) {
     }
     break;
 ```
+
 第四种情况为读取的数据类型为`kLastType`，同`kMiddleType`一样，保证`in_fragmented_record`为`true`。
 在此步进行附加操作时，不仅需要将`record`的值更新为`scratch`中的值，同时还需要更新上一个成功读取的record的偏移量`last_record_offset`。完成所有操作后，返回成功标识符。
 ***
+
 ```C++
   case kEof:
     if (in_fragmented_record) {
@@ -696,8 +763,10 @@ switch (record_type) {
     }
     return false;
 ```
+
 第五种情况为读取的数据类型为`kEof`。若位于文件尾部，若是出现`in_fragment_record == true`(具体原因同上)，则将`scratch`中数据情况。无论任何情况都返回`false`，表示未成功读取到数据。
 ***
+
 ```C++
   case kBadRecord:
     if (in_fragmented_record) {
@@ -707,8 +776,10 @@ switch (record_type) {
     }
     break;
 ```
+
 第六种情况为读取的数据类型为`kBadRecord`。`in_fragment_record`不过多阐述。由于该种情况，既可能是因为读取到的record片段在`initial_offset_`前，也有可能是因为校验码`checksum_`等问题，因此该处仅break，并不返回，重新读取数据来观测后续结果。
 ***
+
 ```C++
   default: {
     char buf[40];
@@ -722,10 +793,12 @@ switch (record_type) {
   }
 }
 ```
+
 最后一种情况为读取数据类型未知，发出报错信息，并更改片段标识符`in_fragmented_record`和清空`scratch`中的数据。报错信息中包含出现错误的数据大小，供后续操作使用。该种情况下依旧不返回，采取重新读取数据的方式。
 若未在循环内返回值(理论上不可能)，则返回false，表示读取失败。0
 ***
 ***
+
 ```C++
 unsigned int Reader::ReadPhysicalRecord(Slice* result) {
   while (true) {
@@ -811,9 +884,12 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result) {
   }
 }
 ```
+
 此段代码较长，切片进行分析
 ***
+
 - 状态判断，是否需要读取或者是否到文件到文件结尾
+
 ```C++
 while (true) {
     if (buffer_.size() < kHeaderSize) {
@@ -841,13 +917,16 @@ while (true) {
       }
     }
 ```
+
 第一个判定是`buffer_`的大小，如果`buffer_`的大小小于`kHeaderSize`，则将清空缓存`buffer_`(这里`buffer_`的条件可以改成`buffer_.size() == 0`，但是可能出现文件末尾填充的情况，因此条件为小于`kHeaderSize`)  
 第二个判定为是否到达文件末尾，若已经到达文件末尾，则直接清空当前缓存`buffer_`(避免不必要的缓存`buffer_`问题)并返回`kEof`表示到达文件末尾。  
 若非文件末尾，则将`buffer_`清空后，从上一个缓存结束的偏移量`end_of_buffer_offset_`开始，读取一个block大小的数据`kBlockSize`到`buffer_`和`backing_store_`当中。其中`file_->Read()`实现方法为先通过循环读取n个字节到`backing_store_`中，将`buffer_`所对应的数据指向`backing_store_`。`buffer_`的`size`保证了即使读取数据字节不足n，也能正常读取，此外，`backing_store_`在运行期间也需要始终保持Live，不能释放掉。  
 之后，更新参数，将`end_of_buffer_offset_`更新，加上`buffer_`的长度，方便之后的校验工作。之后还需判断是否读取成功(文件读取时有无数据遗失)，是否到达文件末尾。第一种情况属于异常情况，需利用`reporter`报告异常情况。这两种情况下，都需要将`eof_`设置为true，但第一种情况直接返回`kEOF`，第二种情况则在下一次循环中返回。
 在此步操作中，将数据读取至`buffer_`和`backing_store_`中，方便后续数据处理操作。
 ***
+
 - 数据读取校验(利用record在block中放置顺序)
+
 ```C++
 // Parse the header
 const char* header = buffer_.data();
@@ -868,10 +947,13 @@ if (kHeaderSize + length > buffer_.size()) {
   return kEof;
 }
 ```
+
 由于每一个block都是以record开始放置的，因此通过block中第一个record的header信息对数据进行校验，此外在同一个block中，record是依次放置的，综上所述`buffer_`的前7位[0:6]为一条record的头部信息。首先计算数据长度`length = a | (b << 8);`，如果一条record长度`kHeaderSize + length`，则说明数据读取中有问题。  
 若不是文件末尾，则证明数据读取时存在数据遗失的情况，需要利用`report`进行报错处理，如果位于文件末尾，这可能是由于没有读取到`|length|`长度的数据，数据存储时Writer中断所导致，因此仅返回到达文件末尾，并不报错，交给后续处理。
 ***
+
 - 0记录以及校验码检测
+
 ```C++
 if (type == kZeroType && length == 0) {
   // Skip zero length record without reporting any drops since
@@ -897,10 +979,13 @@ if (checksum_) {
   }
 }
 ```
+
 若record类型为`kZeroType`，返回`kBadRecord`并跳过即可。该类型为`env_posix.cc`在预分配时出现的数据类型，不由`log_writer.cc`编写相关类型代码。  
 此外利用`crc32c`类中函数对数据进行32位校验码检测，若无法匹配，则利用`reporter`报错，并返回`kBadRecord`。
 ***
+
 - 将record中数据片段赋值
+
 ```C++
 buffer_.remove_prefix(kHeaderSize + length);
 
@@ -913,6 +998,7 @@ if (end_of_buffer_offset_ - buffer_.size() - kHeaderSize - length < initial_offs
 *result = Slice(header + kHeaderSize, length);
 return type;
 ```
+
 **注意: 这里的header指向的是`buffer_`执行`remove_prefix`前最初的数据指针，即`buffer_`执行`remove_prefix`前开始的第一条记录，但并非一定是一个block的第一条记录**  
-`buffer_`首先更新，将数据指针指向`buffer_`中下一条record的开始。 
+`buffer_`首先更新，将数据指针指向`buffer_`中下一条record的开始。
 之后判断该record的头部是否在`initial_offset_`之后，若不在，则清空result并返回`kBadRecord`，交由`ReadRecord`函数进一步操作。若在，则赋值`result`(更新`result`指向的数据)，并返回record的类型。
