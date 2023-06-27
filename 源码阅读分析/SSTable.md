@@ -27,6 +27,8 @@ SST table内部格式为
 
 其中footer为定长，其他由于N的可变性，所以是变长。
 
+![SSTFormat](https://pic1.zhimg.com/80/v2-969d40895a0659d356c3c2e6bd59f904_1440w.webp)
+
 ### 1.1. Footer 格式
 
 ![FooterFormat](https://img-blog.csdnimg.cn/6fc97d6466724818bac71bd7682e8348.png)
@@ -102,9 +104,9 @@ I like to code in C++
 I like to code
 ```
 
-### 1.2. Block格式
+### 1.2. DataBlock格式
 
-![BlockFormat](https://pic1.zhimg.com/80/v2-73468f410dcde74c3841070211c9dac8_1440w.webp)
+![EntryFormat](https://pic1.zhimg.com/80/v2-73468f410dcde74c3841070211c9dac8_1440w.webp)
 
 Block中每条k-v记录被称作一条entry，上图为一条entry的格式。
 每条key采用前缀压缩存储方式，当前entry仅需记录以下信息即可还原完整的key-value对:
@@ -159,3 +161,126 @@ datablock的尾部，然后再把restarts数组的长度也写入，最后形成
 
 `restarts_`记录的这些重启点由于key完整，再搭配SSTable本身key有序的性质，可以作为entry的索引，
 提供二分查找的功能。这大大加速了查找的过程，也是很漂亮的做法。
+
+### 1.3. MetaBlock 格式
+
+MetaBlock中保存的是每2KB DataBlock写入后对其内容进行的[BloomFilter](BloomFilter.md)内容。
+MetaIndex会记录这些MetaBlock的偏移。
+
+## 2. 构建
+
+### 2.1. TableBuilder
+
+在1.2中我们已经介绍了DataBlock的每一条entry是如何被添加到buffer中，重启点又是如何工作的。
+其余几种Block的生成方式都与之类似。
+
+Block中的数据抵达BlockSize阈值后，会被TableBuilder执行`Flush()`来落盘。
+因此SST不会等待所有内容填充完成后再一口气写入，而是从dataBlock开始就逐步写入了。
+用户（自动化进程）一次交互必须call一个结束的指令，调用`Finish`，才能使SST完全落盘。
+
+```C++
+  const size_t estimated_block_size = r->data_block.CurrentSizeEstimate();
+  if (estimated_block_size >= r->options.block_size) {
+    Flush();
+  }
+```
+
+DataBlock会这样被一个一个写入，然而metaBlock和IndexBlock不会，它们因为比较小，
+并且考虑到写入位置必须在DataBlock后，因此会暂存在缓冲区内（也就是保存在变量里面，或者
+写入log之类的），等待DataBlock全部写完后，TableBuilder会call自己的`Finish()`函数，
+才开始写入metaBlock和indexBlock。
+
+这里写入metaBlock（官方内部称作filterBlock，也蛮合理）是用的`WriteRawBlock`函数，
+禁用了Compression。
+
+```c++
+  // Write filter block
+  if (ok() && r->filter_block != nullptr) {
+    WriteRawBlock(r->filter_block->Finish(), kNoCompression,
+                  &filter_block_handle);
+  }
+```
+
+完事儿之后再写入filterBlockIndex，然后再写IndexBlock，然后再写Footer，详细代码就不贴了，
+和这里的到差不差，只是用了`WriteBlock`函数，`WriteBlock`中还有添加CRC等内容，具体就不阐述了。
+
+`Finish`函数和`Abandon`放弃函数在`dbimpl.cc`中一定会被Call其中一个，目的如上述所说，
+是为了保证不出现残缺的SST。
+
+```C++
+  Status s = input->status();
+  const uint64_t current_entries = compact->builder->NumEntries();
+  if (s.ok()) {
+    s = compact->builder->Finish();
+  } else {
+    compact->builder->Abandon();
+  }
+```
+
+## 3. 合成大SST
+
+这里有两种Compaction操作：
+
+1. 从memtable（准确来讲是immutable）到SST的Minor Compaction
+2. 从Low level SST 到 High level SST的Major Compaction
+
+前者很好实现，只需要把immutable的东西检查一下，筛掉被打上删除标记的记录，直接落盘即可。
+基本代码路径是：
+
+DBImpl::CompactMemTable => DBImpl::WriteLevel0Table => BuildTable
+
+```C++
+// CompactMemTable():
+void DBImpl::CompactMemTable() {
+  mutex_.AssertHeld();
+  assert(imm_ != nullptr);
+
+  // Save the contents of the memtable as a new Table
+  VersionEdit edit;
+  Version* base = versions_->current();
+  base->Ref();
+  Status s = WriteLevel0Table(imm_, &edit, base);
+  base->Unref();
+  // ...
+
+// WriteLevel0Table():
+// ...
+// 生成文件，获得锁，创建一个immutable的迭代器iter传入BuildTable函数。
+    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+// ...
+// 写入ManiFest中
+}
+```
+
+Major Compaction更为复杂，
+
+1. 先要对Manifest文件中记录的所有的SST进行一个审查，
+确定需要进行compaction的一个SST，
+2. 然后再检查该SST的低一级的所有SST的key空间范围，两种情况：  
+   1. 如果存在一个低级SST，与高级的SST Key空间没有任何交叠：  
+      直接Level+1，不用合并，轻松愉快。  
+
+    ```c++
+    // ... 上面是manual compaction的情况，不考虑
+    // 选择需要compaction的SST: level-L
+    } else {
+        c = versions_->PickCompaction();
+    }
+
+    Status status;
+    if (c == nullptr) {
+        // Nothing to do
+    } else if (!is_manual 
+                        // 
+                    && c->IsTrivialMove()) {
+        // Move file to next level
+        assert(c->num_input_files(0) == 1);
+        FileMetaData* f = c->input(0, 0);
+        c->edit()->RemoveFile(c->level(), f->number);
+        c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
+                        f->largest);
+    //...
+    ```  
+
+   2. 反之，用多路归并算法把它俩合并。  
+这个多路归并看不太明白。。
