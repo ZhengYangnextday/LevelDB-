@@ -107,7 +107,7 @@ char* EncodeVarint32(char* dst, uint32_t v) {
   return reinterpret_cast<char*>(ptr);
 }
 ```
-对于32位数据进行编码，首先和`EncodeFixed32`一样，将`char`类型指针强制转化为`uint8_t`类型，方便进行字节操作。之后设置类似于掩码的整型常量`static const int B = 128;`。这里128共8字节，二进制表示为0x10000000
+对于32位数据进行编码，首先和`EncodeFixed32`一样，将`char`类型指针强制转化为`uint8_t`类型，方便进行字节操作。之后设置类似于掩码的整型常量`static const int B = 128;`。这里128共8字节，二进制表示为0x10000000，***需注意的是这里的返回指针指向分配的末尾***
 ``` C++
 void PutFixed32(std::string* dst, uint32_t value);
 void PutFixed64(std::string* dst, uint64_t value);
