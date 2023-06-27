@@ -1,7 +1,11 @@
 # LevelDB数据编码
+
 ## 源码解读
+
 LevelDB默认使用小端字节序存储，低位字节排放在内存的低地址端，高位字节排放在内存的高地址端。
+
 ### 整型数据
+
 ``` C++
 inline void EncodeFixed32(char* dst, uint32_t value) {
   uint8_t* const buffer = reinterpret_cast<uint8_t*>(dst);
@@ -13,10 +17,12 @@ inline void EncodeFixed32(char* dst, uint32_t value) {
   buffer[3] = static_cast<uint8_t>(value >> 24);
 }
 ```
+
 这里首先利用`reinterpret_cast`将`char`类型的指针dst转换为`uint8_t`类型的指针buffer，方便进行字节操作。  
 接下来，函数将value的每个字节分别存储到buffer的不同位置，并使用右移位运算符将高位字节移动到正确的位置。最终，buffer中存储的就是按little-endian字节序编码的value的值。  
 先右移，再用uint_8强制转换取后8位。
 ***
+
 ``` C++
 inline uint32_t DecodeFixed32(const char* ptr) {
   const uint8_t* const buffer = reinterpret_cast<const uint8_t*>(ptr);
@@ -28,8 +34,10 @@ inline uint32_t DecodeFixed32(const char* ptr) {
          (static_cast<uint32_t>(buffer[3]) << 24);
 }
 ```
+
 此即为`EncoderFixed32`的反向操作，利用移位操作将数据从buffer中还原，这里不过多阐述
 ***
+
 ``` C++
 inline void EncodeFixed64(char* dst, uint64_t value) {
   uint8_t* const buffer = reinterpret_cast<uint8_t*>(dst);
@@ -60,8 +68,10 @@ inline uint64_t DecodeFixed64(const char* ptr) {
          (static_cast<uint64_t>(buffer[7]) << 56);
 }
 ```
+
 64位数据同上，但需注意dst指向的地址须有足够空间写入对应数据
 ***
+
 ``` C++
 void PutFixed32(std::string* dst, uint32_t value) {
   char buf[sizeof(value)];
@@ -75,9 +85,13 @@ void PutFixed64(std::string* dst, uint64_t value) {
   dst->append(buf, sizeof(buf));
 }
 ```
+
 `sizeof`按字节统计对应数据的大小，此处将value数据存入buf中后，并将对应数据作为字符串附加至dst所指向的字符串后
+
 ### 变长数据
+
 将整型`int`编码成变长整型`varint`可以尽可能节约存储空间。例如一些较小的数字，采用传统`uint32_t`编码需要四个字节，但是利用`varint`则舍弃为0的高位，用较少字节存储信息。具体代码解释如下
+
 ``` C++
 char* EncodeVarint32(char* dst, uint32_t v) {
   // Operate on characters as unsigneds
@@ -107,7 +121,14 @@ char* EncodeVarint32(char* dst, uint32_t v) {
   return reinterpret_cast<char*>(ptr);
 }
 ```
+
 对于32位数据进行编码，首先和`EncodeFixed32`一样，将`char`类型指针强制转化为`uint8_t`类型，方便进行字节操作。之后设置类似于掩码的整型常量`static const int B = 128;`。这里128共8字节，二进制表示为0x10000000
+
+原理：一个字节只用7位表示数据，第8位表示是否扩展到下一字节，从而0~127的数据可以用1字节表示，
+超过127到16383的数据`yyyyyyxxxxxxxx`(14位)
+则需要将第8位置1，截取原二进制中低7位与之拼接，形成`1xxxxxxx`，再与高位数据拼接
+形成`1xxxxxxx0yyyyyyx`(16位，小端)，以此类推。这里的B就是用来按位或置1的。
+
 ``` C++
 void PutFixed32(std::string* dst, uint32_t value);
 void PutFixed64(std::string* dst, uint64_t value);
