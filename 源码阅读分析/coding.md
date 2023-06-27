@@ -121,8 +121,7 @@ char* EncodeVarint32(char* dst, uint32_t v) {
   return reinterpret_cast<char*>(ptr);
 }
 ```
-
-对于32位数据进行编码，首先和`EncodeFixed32`一样，将`char`类型指针强制转化为`uint8_t`类型，方便进行字节操作。之后设置类似于掩码的整型常量`static const int B = 128;`。这里128共8字节，二进制表示为0x10000000
+对于32位数据进行编码，首先和`EncodeFixed32`一样，将`char`类型指针强制转化为`uint8_t`类型，方便进行字节操作。之后设置类似于掩码的整型常量`static const int B = 128;`。这里128共8字节，二进制表示为0x10000000 ***需注意的是这里的返回指针指向分配的末尾***
 
 原理：一个字节只用7位表示数据，第8位表示是否扩展到下一字节，从而0~127的数据可以用1字节表示，
 超过127到16383的数据`yyyyyyxxxxxxxx`(14位)
