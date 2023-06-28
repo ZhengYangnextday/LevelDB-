@@ -28,7 +28,10 @@ SST table内部格式为
 其中footer为定长，其他由于N的可变性，所以是变长。
 
 ![SSTFormat](https://pic1.zhimg.com/80/v2-969d40895a0659d356c3c2e6bd59f904_1440w.webp)
+  
+整体文件格式如下
 
+![SSTable_Full](https://img-blog.csdnimg.cn/img_convert/c1251bf95451102b36a2e4c454c833ca.png)
 ### 1.1. Footer 格式
 
 ![FooterFormat](https://img-blog.csdnimg.cn/6fc97d6466724818bac71bd7682e8348.png)
@@ -255,7 +258,9 @@ void DBImpl::CompactMemTable() {
 Major Compaction更为复杂，
 
 1. 先要对Manifest文件中记录的所有的SST进行一个审查，
-确定需要进行compaction的一个SST，
+确定需要进行compaction的一个SST。  
+这里确定确定最适合进行的compaction的SST的方法是通过版本控制`version_set.cc`和`version_set.h`中`compaction_score_`变量进行衡量，同时每个版本都会有一个变量跟踪当前版本中最适合进行compaction的level(`current_->compaction_level_`)，`compaction_score_`计算方法为`score =static_cast<double>(level_bytes) / MaxBytesForLevel(options_, level)`，当前level数据大小`level_bytes`越靠近上限，score值越高。  
+  除此之外，版本控制`version_set`还维持一个`KNUmLevels`的数组`compact_pointer_`，用来记录不同level中上次被compaction的最大key的值，下次再对这个level进行compaction时，就直接从key大于`compact_pointer_[level]`的文件开始，降低时间复杂度。  
 2. 然后再检查该SST的低一级的所有SST的key空间范围，两种情况：  
    1. 如果存在一个低级SST，与高级的SST Key空间没有任何交叠：  
       直接Level+1，不用合并，轻松愉快。  
@@ -270,17 +275,98 @@ Major Compaction更为复杂，
     Status status;
     if (c == nullptr) {
         // Nothing to do
-    } else if (!is_manual 
-                        // 
-                    && c->IsTrivialMove()) {
+    } 
+    else if (!is_manual  && c->IsTrivialMove()) {
         // Move file to next level
         assert(c->num_input_files(0) == 1);
         FileMetaData* f = c->input(0, 0);
         c->edit()->RemoveFile(c->level(), f->number);
         c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                         f->largest);
-    //...
+        status = versions_->LogAndApply(c->edit(), &mutex_);
+        if (!status.ok()) {
+          RecordBackgroundError(status);
+        }
+        VersionSet::LevelSummaryStorage tmp;
+        Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
+            static_cast<unsigned long long>(f->number), c->level() + 1,
+            static_cast<unsigned long long>(f->file_size),
+            status.ToString().c_str(), versions_->LevelSummary(&tmp));
+    }
     ```  
 
    2. 反之，用多路归并算法把它俩合并。  
-这个多路归并看不太明白。。
+    ```C++
+    else {
+    CompactionState* compact = new CompactionState(c);
+    status = DoCompactionWork(compact);
+    if (!status.ok()) {
+      RecordBackgroundError(status);
+    }
+    CleanupCompaction(compact);
+    c->ReleaseInputs();
+    RemoveObsoleteFiles();
+    }
+    ```
+    该部分主体工作位于`DBImpl::DoCompactionWork`，接下来将着重分析该部分源码。  
+    在正式分析前，对多路归并进行总体说明。多路归并算法思路比较简单，即从当前Level中选择一个SST文件，然后从Level+1中找到所有和这个文件的Key范围有重合的文件进行合并，最后将合并的文件都放在Level+1中。当然，这一点的实现是基于同一个Level中的文件Key值都不会有重合，但是Level0的文件作为例外，还需额外判断。  
+    在以上说明中，需保存涉及到的文件参数。这一点主要通过`PickCompaction()`函数实现，并将文件信息保存至`compaction`类中成员变量`inputs_`数组中。`inputs_[0]`包含需进行合并Level的文件信息，`inputs_[1]`包含Level+1中需要和Level进行合并的文件信息。除Level0外`inputs_[0]`应只包含一个文件信息。
+
+    ***
+    首先，定义迭代器，访问`compact`的`inputs_`数组里所指向文件的Key_Value。
+    ```C++
+    Iterator* input = versions_->MakeInputIterator(compact->compaction);
+    mutex_.Unlock();
+    input->SeekToFirst();
+    ```
+    同时，初始化变量，供后续使用
+    ```C++
+    Status status;
+    ParsedInternalKey ikey;
+    std::string current_user_key;
+    bool has_current_user_key = false;
+    SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+    ```
+    ***
+    之后，进入大循环，通过迭代器`input`遍历`inputs_`数组中的所有文件，即所有参与`compaction`的文件，并获取其对应的键值key。该循环用于判断KV记录是否需要合并入生成文件中。
+    ```C++
+    while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
+      // Prioritize immutable compaction work
+      if (has_imm_.load(std::memory_order_relaxed)) {
+        const uint64_t imm_start = env_->NowMicros();
+        mutex_.Lock();
+        if (imm_ != nullptr) {
+          //将imm_数据写入磁盘，即前面描述的Minor Compaction
+          CompactMemTable();
+          // Wake up MakeRoomForWrite() if necessary.
+          background_work_finished_signal_.SignalAll();
+        }
+        mutex_.Unlock();
+        imm_micros += (env_->NowMicros() - imm_start);
+      }
+    ```
+    循环首先检查当前的`imm_`是否为空，若不为空，则按照前面所说明的Minor Compaction的方式，将`imm_`数据落盘，避免因`imm_`未及时落盘，导致用户线程无法向磁盘写入新数据。
+    ***
+    ```C++
+    Slice key = input->key();
+    if (compact->compaction->ShouldStopBefore(key) &&
+        compact->builder != nullptr) {
+      status = FinishCompactionOutputFile(compact, input);
+      if (!status.ok()) {
+        break;
+      }
+    }
+    ```
+    然后，先将当前迭代器所指向的Key提取出来。根据Compaction类中的`ShouldStopBefore`函数判断是否符合生成一个新的sstable的条件。如果符合，则利用`FinishCompactionOutputFile`函数，将sstable写盘，若不符合要求则继续操作，**需注意的是，无论是否将sstable落盘，直至此步结束时还未将Key-Value写入任何的sstable中** 
+    注意这里`ShouldStopBefore`类实现是根据Compaction类中的`grandparents_`数组和`grandparent_index`实现的，用于控制生成的sstable文件的大小，同时避免Level和Level+2有过多的文件重合，导致单个文件承担过大的合并压力。  
+    ***
+    接下来，需判断该key值是否应该假如当前的SSTable中，利用`bool drop = false;`作为标志位进行判断，若`drop`为`true`则说明该Key值需丢弃。  
+    ```C++
+   if (!ParseInternalKey(key, &ikey)) {
+      // Do not hide error keys
+      current_user_key.clear();
+      has_current_user_key = false;
+      last_sequence_for_key = kMaxSequenceNumber;
+    }
+    ```
+    **注意，本步相较于常识会比较奇怪**，即在处理不合法数据`!ParseInternalKey(key, &ikey)`时，并不选择丢弃，而是保存下来。根据代码中注释，这样做可能是为了
