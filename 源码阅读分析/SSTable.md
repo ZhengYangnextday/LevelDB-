@@ -369,4 +369,86 @@ Major Compaction更为复杂，
       last_sequence_for_key = kMaxSequenceNumber;
     }
     ```
-    **注意，本步相较于常识会比较奇怪**，即在处理不合法数据`!ParseInternalKey(key, &ikey)`时，并不选择丢弃，而是保存下来。根据代码中注释，这样做可能是为了
+    **注意，本步相较于常识会比较奇怪**，即在处理不合法数据`!ParseInternalKey(key, &ikey)`时，并不选择丢弃，而是保存下来。根据代码中注释，这样做可以保留系统中的错误，可能方便之后问题查漏。**同时还值得注意的是，在本步当中ParseInternalKey(key, &ikey)函数主要功能并非判断数据是否合法，根据C语言特性，即使不满足条件，该函数依旧会先执行，将`key`中数据(`sequence`,`type`,`key`)解析出来，并放在`ikey`中**。
+    倘若Key-Value形式合法，则进入下一层判断  
+    ```C++
+    else {
+      if (!has_current_user_key ||
+          user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
+              0) {
+        // First occurrence of this user key
+        current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+        has_current_user_key = true;
+        last_sequence_for_key = kMaxSequenceNumber;
+      }
+    ```
+    首先，根据当前是否存在键值标识符`has_current_user_key`以及判断当前迭代器的键值是否和前面加入的键值相等` user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) != 0`(为0代表这个key和之前加入的key相等，即当前key值为过期的key值)。如果`ikey`是第一次出现，则将`current_user_key`附加该键值。这一步可以确保`current_user_key`中存储的key值全部不同。  
+    无论是否出现过，即无论是否为过期数据，都还需进一步判断才能明确是否把它加入新的SSTable中。  
+    可以分为以下几种情况  
+    - 非过期的Key值，且数据类型并不是kTypeDeletion
+    - 非过期的Key值，数据类型为kTypeDeletion
+    - 过期的key值，但位于数据快照内
+    - 过期的Key值，且不位于数据快照内  
+  
+    分别讨论这几种情况在代码中的处理方式  
+    ***
+    对于是否位于数据快照内，
+    ```C++
+    if (last_sequence_for_key <= compact->smallest_snapshot) {
+        // Hidden by an newer entry for same user key
+        drop = true;  // (A)
+      }
+    ```
+    直接进行判断，因为如果是第一次出现的Key值，`last_sequence_for_key`将被设置为`kMaxSequenceNumber`，必定大于`compact->smallest_snapshot`，因此不会进入该循环。只有当数据为过期数据时才会进入该判断条件。  
+    对于数据类型是否为kTypeDeletion,
+    ```C++
+    else if (ikey.type == kTypeDeletion &&
+                 ikey.sequence <= compact->smallest_snapshot &&
+                 compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
+        // For this user key:
+        // (1) there is no data in higher levels
+        // (2) data in lower levels will have larger sequence numbers
+        // (3) data in layers that are being compacted here and have
+        //     smaller sequence numbers will be dropped in the next
+        //     few iterations of this loop (by rule (A) above).
+        // Therefore this deletion marker is obsolete and can be dropped.
+        drop = true;
+      }
+    ```
+    注意这里需满足三个要求，而非只有对于数据类型的判断。第一个判断数据类型`ikey.type == kTypeDeletion`；第二个判断该数据是否需数据快照，若需要数据快照依旧不会丢弃;第三个判断为这里最为关键的判断，将详细解释。  
+    数据库删除key的操作为插入类型为`kTypeDeletion`的记录，但是在系统运行中可能在更高层还存在对应的key值，若在此处直接丢弃，则在高层SSTable中本应被丢弃的key值将继续保留，因此还需保证整个数据库中不存在对应的key值，否则还需将其保留，直至下一次合并时，通过`kTypeDeletion`的合并实现删除操作。这里实现的方法的是利用`IsBadeLevelForKey`函数判断更高Level中是否存在对应的key值，若存在，则还需保留该key值。
+    ***
+    最后，经过所有判断后，将键值的sequence更新，结束丢弃标志位`drop`的判断
+    ```C++
+    last_sequence_for_key = ikey.sequence;
+    }
+    ```
+    之后，根据`drop`判断是否写入，并更新迭代器`input`到下一个键值，结束一轮循环。
+    ```C++
+        if (!drop) {
+        // Open output file if necessary
+        if (compact->builder == nullptr) {
+          status = OpenCompactionOutputFile(compact);
+          if (!status.ok()) {
+            break;
+          }
+        }
+        if (compact->builder->NumEntries() == 0) {
+          compact->current_output()->smallest.DecodeFrom(key);
+        }
+        compact->current_output()->largest.DecodeFrom(key);
+        compact->builder->Add(key, input->value());
+
+        // Close output file if it is big enough
+        if (compact->builder->FileSize() >=
+            compact->compaction->MaxOutputFileSize()) {
+          status = FinishCompactionOutputFile(compact, input);
+          if (!status.ok()) {
+            break;
+          }
+        }
+      }
+
+      input->Next();
+    ```
+    ***
